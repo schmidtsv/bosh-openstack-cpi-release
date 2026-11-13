@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"encoding/json"
 	"testing/fstest"
 
 	"github.com/cloudfoundry/bosh-cpi-go/apiv1"
@@ -299,6 +300,64 @@ var _ = Describe("OpenstackConfig", func() {
 			Expect(cpiConfig.Cloud.Properties.Openstack.AuthOptions().ApplicationCredentialID).To(Equal("the_application_credential_id"))
 			Expect(cpiConfig.Cloud.Properties.Openstack.AuthOptions().ApplicationCredentialSecret).To(Equal("the_application_credential_secret"))
 		})
+
+		Context("Keystone v3 token request", func() {
+			keystoneV3Request := func(openstackJSON string) string {
+				var openstackConfig config.OpenstackConfig
+				Expect(json.Unmarshal([]byte(openstackJSON), &openstackConfig)).To(Succeed())
+
+				opts := openstackConfig.AuthOptions()
+				scope, err := opts.ToTokenV3ScopeMap()
+				Expect(err).ToNot(HaveOccurred())
+				body, err := opts.ToTokenV3CreateMap(scope)
+				Expect(err).ToNot(HaveOccurred())
+				bodyJSON, err := json.Marshal(body)
+				Expect(err).ToNot(HaveOccurred())
+				return string(bodyJSON)
+			}
+
+			It("authenticates the user in user_domain_name and scopes the project to project_domain_name", func() {
+				Expect(keystoneV3Request(`{
+					"username": "the_username",
+					"api_key": "the_api_key",
+					"user_domain_name": "the_user_domain",
+					"project_domain_name": "the_project_domain",
+					"project": "the_project"
+				}`)).To(MatchJSON(`{"auth": {
+					"identity": {"methods": ["password"], "password": {"user": {
+						"name": "the_username", "password": "the_api_key", "domain": {"name": "the_user_domain"}}}},
+					"scope": {"project": {"name": "the_project", "domain": {"name": "the_project_domain"}}}
+				}}`))
+			})
+
+			It("falls back to domain for the project domain when only user_domain_name is given", func() {
+				Expect(keystoneV3Request(`{
+					"username": "the_username",
+					"api_key": "the_api_key",
+					"domain": "the_domain",
+					"user_domain_name": "the_user_domain",
+					"project": "the_project"
+				}`)).To(MatchJSON(`{"auth": {
+					"identity": {"methods": ["password"], "password": {"user": {
+						"name": "the_username", "password": "the_api_key", "domain": {"name": "the_user_domain"}}}},
+					"scope": {"project": {"name": "the_project", "domain": {"name": "the_domain"}}}
+				}}`))
+			})
+
+			It("scopes by project_id independent of the user domain, preferring it over project", func() {
+				Expect(keystoneV3Request(`{
+					"username": "the_username",
+					"api_key": "the_api_key",
+					"domain": "the_user_domain",
+					"project": "the_project",
+					"project_id": "the_project_id"
+				}`)).To(MatchJSON(`{"auth": {
+					"identity": {"methods": ["password"], "password": {"user": {
+						"name": "the_username", "password": "the_api_key", "domain": {"name": "the_user_domain"}}}},
+					"scope": {"project": {"id": "the_project_id"}}
+				}}`))
+			})
+		})
 	})
 	Context("MergeContext", func() {
 		var openstackConfig config.OpenstackConfig
@@ -483,6 +542,27 @@ var _ = Describe("OpenstackConfig", func() {
 
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("credential field \"api_key\" must be a string"))
+		})
+
+		It("drops the static project_id when the context selects the project by name", func() {
+			openstackConfig.ProjectID = "the_static_project_id"
+			ctx := apiv1.CloudPropsImpl{RawMessage: []byte(`{"project": "the_context_project"}`)}
+
+			merged, err := openstackConfig.MergeContext(ctx)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(merged.ProjectName).To(Equal("the_context_project"))
+			Expect(merged.ProjectID).To(BeEmpty())
+		})
+
+		It("drops the static project name when the context selects the project by project_id", func() {
+			ctx := apiv1.CloudPropsImpl{RawMessage: []byte(`{"project_id": "the_context_project_id"}`)}
+
+			merged, err := openstackConfig.MergeContext(ctx)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(merged.ProjectID).To(Equal("the_context_project_id"))
+			Expect(merged.ProjectName).To(BeEmpty())
 		})
 
 		It("returns the unmodified config when the context carries no OpenStack overrides", func() {

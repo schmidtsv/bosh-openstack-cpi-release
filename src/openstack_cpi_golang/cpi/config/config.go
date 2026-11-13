@@ -1,6 +1,7 @@
 package config
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -104,6 +105,16 @@ func (o OpenstackConfig) MergeContext(ctx apiv1.CallContext) (OpenstackConfig, e
 		delete(merged, "api_key")
 	}
 
+	// project_id and project are alternative ways to select the project, and
+	// AuthOptions() prefers project_id. When the context selects the project one
+	// way, remove the other way from the base config so the context wins.
+	if isNonEmptyString(contextFields["project"]) {
+		delete(merged, "project_id")
+	}
+	if isNonEmptyString(contextFields["project_id"]) {
+		delete(merged, "project")
+	}
+
 	for key, value := range contextFields {
 		merged[key] = value
 	}
@@ -119,6 +130,11 @@ func (o OpenstackConfig) MergeContext(ctx apiv1.CallContext) (OpenstackConfig, e
 	}
 
 	return result, nil
+}
+
+func isNonEmptyString(raw json.RawMessage) bool {
+	var value string
+	return json.Unmarshal(raw, &value) == nil && value != ""
 }
 
 func (c CpiConfig) Properties() Properties {
@@ -151,7 +167,10 @@ type OpenstackConfig struct {
 	UseNovaNetworking            bool           `json:"use_nova_networking"`
 	ConnectionOptions            map[string]any `json:"connection_options"`
 	DomainName                   string         `json:"domain"`
+	UserDomainName               string         `json:"user_domain_name"`
+	ProjectDomainName            string         `json:"project_domain_name"`
 	ProjectName                  string         `json:"project"`
+	ProjectID                    string         `json:"project_id"`
 	Tenant                       string         `json:"tenant"`
 	StateTimeOut                 int            `json:"state_timeout"`
 	StemcellPubliclyVisible      bool           `json:"stemcell_public_visibility"`
@@ -217,13 +236,32 @@ func (o OpenstackConfig) Validate() error {
 
 func (o OpenstackConfig) AuthOptions() gophercloud.AuthOptions {
 	if o.usernameIsSet() {
-		return gophercloud.AuthOptions{
+		opts := gophercloud.AuthOptions{
 			IdentityEndpoint: o.AuthURL,
 			Username:         o.Username,
 			Password:         o.APIKey,
-			DomainName:       o.DomainName,
-			TenantName:       o.ProjectName,
+			DomainName:       cmp.Or(o.UserDomainName, o.DomainName),
 		}
+
+		// project_id takes precedence over project, as in the former Ruby CPI.
+		// Gophercloud scopes a TenantID by project ID alone, independent of the
+		// user's domain.
+		if o.ProjectID != "" {
+			opts.TenantID = o.ProjectID
+			return opts
+		}
+
+		opts.TenantName = o.ProjectName
+		// Gophercloud scopes a TenantName to the user's domain, so a project
+		// living in a different domain needs an explicit scope.
+		projectDomainName := cmp.Or(o.ProjectDomainName, o.DomainName)
+		if o.ProjectName != "" && projectDomainName != "" && projectDomainName != opts.DomainName {
+			opts.Scope = &gophercloud.AuthScope{
+				ProjectName: o.ProjectName,
+				DomainName:  projectDomainName,
+			}
+		}
+		return opts
 	} else {
 		return gophercloud.AuthOptions{
 			IdentityEndpoint:            o.AuthURL,
